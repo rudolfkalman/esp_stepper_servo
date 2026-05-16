@@ -1,5 +1,5 @@
-#include <math.h>
 #include <errno.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,6 +18,7 @@
 
 #include "driver/i2c_master.h"
 #include "driver/uart.h"
+#include "esp_err.h"
 #include "esp_log.h"
 
 #include "esp_timer.h"
@@ -28,6 +29,13 @@
 #define CMD_BUF_SIZE 256U
 #define MAX_CMD_LENGTH (CMD_BUF_SIZE - 1U)
 #define MIN_PWM_PERIOD_TICKS 2U
+#define AS5600_TIMEOUT_MS 100
+#define AS5600_MAX_READ_FAILURES 10
+#define AS5600_READ_INTERVAL_MS 50
+#define SERVO_LOG_INTERVAL_MS 200
+#define VELOCITY_LOG_INTERVAL_MS 200
+#define MODE2_LOG_INTERVAL_MS 200
+#define UART_RX_DRAIN_CHUNKS 4
 
 static mcpwm_timer_handle_t timer = NULL;
 static mcpwm_oper_handle_t oper = NULL;
@@ -73,6 +81,7 @@ int32_t max_speed_hz = 37000;
 int32_t min_speed_hz = 100;
 int32_t servo_accel_hz = 5000;
 int32_t accel_hz = 500; // Acceleration Limit
+int32_t mode2_accel_hz_per_sec = 500;
 
 float target_angle = 120;
 float target_velocity = 0.0;
@@ -85,6 +94,12 @@ float prev_angle = 0.0;
 float velocity = 0.0;
 float prev_velocity = 0.0;
 bool velocity_measurement_ready = false;
+bool servo_target_reached = false;
+uint8_t as5600_read_fail_count = 0;
+uint64_t last_as5600_read_time = 0;
+uint64_t last_servo_log_time = 0;
+uint64_t last_velocity_log_time = 0;
+uint64_t last_mode2_log_time = 0;
 
 float error_angle = 0.0;
 float prev_error_angle = 0.0;
@@ -216,18 +231,32 @@ void I2C_Detect() {
 }
 
 bool GetRawAngle(float *angle) {
-  uint8_t recv_buff[2];
-  uint16_t raw_angle = 0x00;
-  esp_err_t ret = i2c_master_transmit_receive(as5600_handler, &RAW_ANGLE_ADDR,
-                                              1, recv_buff, 2, -1);
-  if (ret == ESP_OK) {
-    raw_angle = raw_angle | ((uint16_t)recv_buff[0] << 8) | recv_buff[1];
-    raw_angle = (raw_angle & 0x0FFF);
-    *angle = (float)raw_angle / 4095 * 360;
-    return false;
-  } else {
+  if (as5600_handler == NULL || angle == NULL) {
     return true;
   }
+
+  uint64_t now = esp_timer_get_time();
+  if (last_as5600_read_time != 0 &&
+      (now - last_as5600_read_time) <
+          (uint64_t)AS5600_READ_INTERVAL_MS * 1000ULL) {
+    return false;
+  }
+
+  uint8_t reg = RAW_ANGLE_ADDR;
+  uint8_t recv_buff[2] = {0};
+
+  esp_err_t ret = i2c_master_transmit_receive(as5600_handler, &reg, 1,
+                                              recv_buff, 2, AS5600_TIMEOUT_MS);
+  if (ret != ESP_OK) {
+    printf("AS5600 I2C error: %s\n", esp_err_to_name(ret));
+    return true;
+  }
+
+  uint16_t raw_angle = ((uint16_t)recv_buff[0] << 8) | recv_buff[1];
+  raw_angle &= 0x0FFF;
+  *angle = (float)raw_angle * 360.0f / 4096.0f;
+  last_as5600_read_time = now;
+  return false;
 }
 
 void swuart_calcCRC(uint8_t *datagram, uint8_t datagramLength) {
@@ -288,6 +317,12 @@ void parse() {
     integral_error_angle = 0.0f;
     prev_error_angle = 0.0f;
     velocity_measurement_ready = false;
+    servo_target_reached = false;
+    as5600_read_fail_count = 0;
+    last_as5600_read_time = 0;
+    last_servo_log_time = 0;
+    last_velocity_log_time = 0;
+    last_mode2_log_time = 0;
 
     printf("Angle updated: %.2f\n", target_angle);
   } else if (strncmp(cmd_buf, "SETVELOCITY:", 12) == 0) {
@@ -303,6 +338,12 @@ void parse() {
     integral_error_velocity = 0.0f;
     prev_error_velocity = 0.0f;
     velocity_measurement_ready = false;
+    servo_target_reached = false;
+    as5600_read_fail_count = 0;
+    last_as5600_read_time = 0;
+    last_servo_log_time = 0;
+    last_velocity_log_time = 0;
+    last_mode2_log_time = 0;
     gpio_set_level(DIR_PIN, (target_velocity >= 0.0f));
 
     printf("Velocity updated: %.2f\n", target_velocity);
@@ -316,6 +357,12 @@ void parse() {
     integral_error_angle = 0.0f;
     integral_error_velocity = 0.0f;
     velocity_measurement_ready = false;
+    servo_target_reached = false;
+    as5600_read_fail_count = 0;
+    last_as5600_read_time = 0;
+    last_servo_log_time = 0;
+    last_velocity_log_time = 0;
+    last_mode2_log_time = 0;
     stop_pwm_output();
 
     printf("EMERGENCY STOP\n");
@@ -330,6 +377,12 @@ void parse() {
     MODE = 2;
     target_hz_m2 = val;
     velocity_measurement_ready = false;
+    servo_target_reached = false;
+    as5600_read_fail_count = 0;
+    last_as5600_read_time = 0;
+    last_servo_log_time = 0;
+    last_velocity_log_time = 0;
+    last_mode2_log_time = 0;
 
     printf("Mode 2 target Hz updated: %ld\n", (long)target_hz_m2);
   } else {
@@ -337,47 +390,48 @@ void parse() {
   }
 }
 
-
 void receive() {
-  int length = uart_read_bytes(uart_num_pc, data, sizeof(data) - 1, 100);
-  if (length <= 0) {
-    return;
-  }
+  for (int chunk = 0; chunk < UART_RX_DRAIN_CHUNKS; chunk++) {
+    int length = uart_read_bytes(uart_num_pc, data, sizeof(data) - 1, 0);
+    if (length <= 0) {
+      return;
+    }
 
-  for (int i = 0; i < length; i++) {
-    uint8_t ch = (uint8_t)data[i];
+    for (int i = 0; i < length; i++) {
+      uint8_t ch = (uint8_t)data[i];
 
-    if (ch == '\n') {
-      if (cmd_discarding) {
-        printf("Invalid input line discarded\n");
-        cmd_discarding = false;
-      } else {
-        cmd_buf[cmd_buf_pos] = '\0';
-        parse();
+      if (ch == '\n') {
+        if (cmd_discarding) {
+          printf("Invalid input line discarded\n");
+          cmd_discarding = false;
+        } else {
+          cmd_buf[cmd_buf_pos] = '\0';
+          parse();
+        }
+        reset_command_buffer();
+        continue;
       }
-      reset_command_buffer();
-      continue;
-    }
 
-    if (ch == '\r') {
-      continue;
-    }
+      if (ch == '\r') {
+        continue;
+      }
 
-    if (cmd_discarding) {
-      continue;
-    }
+      if (cmd_discarding) {
+        continue;
+      }
 
-    if (ch < 0x20 || ch > 0x7e) {
-      reset_command_buffer();
-      cmd_discarding = true;
-      continue;
-    }
+      if (ch < 0x20 || ch > 0x7e) {
+        reset_command_buffer();
+        cmd_discarding = true;
+        continue;
+      }
 
-    if (cmd_buf_pos < MAX_CMD_LENGTH) {
-      cmd_buf[cmd_buf_pos++] = (char)ch;
-    } else {
-      reset_command_buffer();
-      cmd_discarding = true;
+      if (cmd_buf_pos < MAX_CMD_LENGTH) {
+        cmd_buf[cmd_buf_pos++] = (char)ch;
+      } else {
+        reset_command_buffer();
+        cmd_discarding = true;
+      }
     }
   }
 }
@@ -462,10 +516,10 @@ void app_main() {
 
   // I2C
   i2c_master_bus_config_t bus_conf = {
-      .i2c_port = -1,
+      .i2c_port = I2C_NUM_0,
       .sda_io_num = 21,
       .scl_io_num = 22,
-      .clk_source = I2C_CLK_SRC_DEFAULT,
+      .clk_source = I2C_CLK_SRC_APB,
       .glitch_ignore_cnt = 7,
   };
   ESP_ERROR_CHECK(i2c_new_master_bus(&bus_conf, &bus_handler));
@@ -473,7 +527,7 @@ void app_main() {
   i2c_device_config_t as5600_conf = {
       .dev_addr_length = I2C_ADDR_BIT_LEN_7,
       .device_address = AS5600_ADDR,
-      .scl_speed_hz = 400000,
+      .scl_speed_hz = 100000,
   };
 
   ESP_ERROR_CHECK(
@@ -498,14 +552,6 @@ void app_main() {
   ESP_ERROR_CHECK(uart_param_config(uart_num_pc, &uart_config));
   ESP_ERROR_CHECK(uart_set_pin(uart_num, UART_RX, UART_TX, -1, -1));
   ESP_ERROR_CHECK(uart_set_pin(uart_num_pc, 1, 3, -1, -1));
-
-  uint8_t current_as5600_conf;
-  i2c_master_transmit_receive(as5600_handler, &CONF_L, 1, &current_as5600_conf,
-                              1, -1);
-  current_as5600_conf |= (0x03 << 2);
-
-  uint8_t write_buf[2] = {CONF_L, current_as5600_conf};
-  i2c_master_transmit(as5600_handler, write_buf, 2, -1);
 
   uint32_t data = 0x00;
   data = data | (0x01 << 6) | (0x01 << 7) | (0x01 << 8) | (0x01 << 2);
@@ -539,6 +585,8 @@ void app_main() {
   uint64_t prev_time = esp_timer_get_time();
 
   while (true) {
+    receive();
+
     uint64_t current_time = esp_timer_get_time();
     dt = (float)(current_time - prev_time) / 1000000.0f;
     if (dt <= 0.0f) {
@@ -549,9 +597,24 @@ void app_main() {
     bool angle_read_failed = needs_angle && GetRawAngle(&angle);
     if (needs_angle && angle_read_failed) {
       stop_pwm_output();
+      as5600_read_fail_count++;
+      velocity_measurement_ready = false;
+      if (as5600_read_fail_count >= AS5600_MAX_READ_FAILURES) {
+        MODE = -1;
+        speed_hz = 0;
+        prev_speed_hz = 0;
+        integral_error_angle = 0.0f;
+        integral_error_velocity = 0.0f;
+        printf("AS5600 read failed %u times, stopped\n",
+               (unsigned)as5600_read_fail_count);
+        as5600_read_fail_count = 0;
+      }
       vTaskDelay(pdMS_TO_TICKS(5));
       receive();
       continue;
+    }
+    if (needs_angle) {
+      as5600_read_fail_count = 0;
     }
     // MODE SERVO
     if (MODE == 0) {
@@ -568,13 +631,16 @@ void app_main() {
         prev_speed_hz = 0;
         integral_error_angle = 0.0f;
         stop_pwm_output();
-        // printf("STOPPED | Angle: %.2f | Error: %.2f\n", angle,
-        // error_angle);
+        if (!servo_target_reached) {
+          printf("STOPPED | Angle: %.2f | Error: %.2f\n", angle, error_angle);
+          servo_target_reached = true;
+        }
         vTaskDelay(pdMS_TO_TICKS(5));
         receive();
         continue;
       }
 
+      servo_target_reached = false;
       integral_error_angle += error_angle * dt;
 
       float control_hz = fabs(kp_angle * error_angle +
@@ -612,8 +678,13 @@ void app_main() {
 
       prev_error_angle = error_angle;
       prev_speed_hz = speed_hz;
-      /*printf("Angle: %.2f | Target: %.2f | Error: %.2f |Freq: %ld Hz\n",
-         angle, target_angle, error_angle, speed_hz);*/
+      if (last_servo_log_time == 0 ||
+          (current_time - last_servo_log_time) >=
+              (uint64_t)SERVO_LOG_INTERVAL_MS * 1000ULL) {
+        printf("Angle: %.2f | Target: %.2f | Error: %.2f | Freq: %ld Hz\n",
+               angle, target_angle, error_angle, (long)speed_hz);
+        last_servo_log_time = current_time;
+      }
 
       vTaskDelay(pdMS_TO_TICKS(5));
     }
@@ -680,9 +751,14 @@ void app_main() {
       prev_velocity = velocity;
       prev_speed_hz = speed_hz;
 
-      /*printf("Velocity: %.2f deg/s | Target: %.2f deg/s | Error: %.2f deg/s
-         | " "Freq: %ld Hz\n", velocity, target_velocity, error_velocity,
-         speed_hz);*/
+      if (last_velocity_log_time == 0 ||
+          (current_time - last_velocity_log_time) >=
+              (uint64_t)VELOCITY_LOG_INTERVAL_MS * 1000ULL) {
+        printf("Velocity: %.2f deg/s | Target: %.2f deg/s | Error: %.2f deg/s | "
+               "Freq: %ld Hz\n",
+               velocity, target_velocity, error_velocity, (long)speed_hz);
+        last_velocity_log_time = current_time;
+      }
       vTaskDelay(pdMS_TO_TICKS(1));
     }
     // MODE STOP
@@ -693,12 +769,17 @@ void app_main() {
     }
     // MODE AUTO ROTATION
     else if (MODE == 2) {
+      int32_t mode2_step_hz = (int32_t)(mode2_accel_hz_per_sec * dt);
+      if (mode2_step_hz < 1) {
+        mode2_step_hz = 1;
+      }
+
       if (current_hz_m2 < target_hz_m2) {
-        current_hz_m2 += accel_hz;
+        current_hz_m2 += mode2_step_hz;
         if (current_hz_m2 > target_hz_m2)
           current_hz_m2 = target_hz_m2;
       } else if (current_hz_m2 > target_hz_m2) {
-        current_hz_m2 -= accel_hz;
+        current_hz_m2 -= mode2_step_hz;
         if (current_hz_m2 < target_hz_m2)
           current_hz_m2 = target_hz_m2;
       }
@@ -718,6 +799,14 @@ void app_main() {
           abs_hz = max_speed_hz;
 
         update_pwm_frequency(abs_hz);
+      }
+
+      if (last_mode2_log_time == 0 ||
+          (current_time - last_mode2_log_time) >=
+              (uint64_t)MODE2_LOG_INTERVAL_MS * 1000ULL) {
+        printf("Mode 2 | Current: %ld Hz | Target: %ld Hz\n",
+               (long)current_hz_m2, (long)target_hz_m2);
+        last_mode2_log_time = current_time;
       }
       vTaskDelay(pdMS_TO_TICKS(5));
     }
