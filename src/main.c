@@ -1,6 +1,10 @@
 #include <math.h>
+#include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,6 +23,11 @@
 #include "esp_timer.h"
 
 #define EPSILON 1e-6
+#define MCPWM_RES_HZ 1000000U
+#define DEFAULT_PERIOD_TICKS 1000U
+#define CMD_BUF_SIZE 256U
+#define MAX_CMD_LENGTH (CMD_BUF_SIZE - 1U)
+#define MIN_PWM_PERIOD_TICKS 2U
 
 static mcpwm_timer_handle_t timer = NULL;
 static mcpwm_oper_handle_t oper = NULL;
@@ -29,9 +38,16 @@ static i2c_master_bus_handle_t bus_handler = NULL;
 static i2c_master_dev_handle_t as5600_handler = NULL;
 
 const int uart_buffer_size = (1024 * 2);
-QueueHandle_t uart_queue;
+QueueHandle_t uart_queue_motor;
+QueueHandle_t uart_queue_pc;
 const uart_port_t uart_num = UART_NUM_1;
 const uart_port_t uart_num_pc = UART_NUM_0;
+
+char data[256] = {0};
+char cmd_buf[CMD_BUF_SIZE] = {0};
+uint32_t cmd_buf_pos = 0;
+bool cmd_is_ready = false;
+bool cmd_discarding = false;
 
 uint8_t AS5600_ADDR = 0x36;
 uint8_t CONF_H = 0x07;
@@ -47,6 +63,130 @@ uint8_t RAW_ANGLE_ADDR = 0x0C;
 #define TPOWERDOWN_REG 0x11
 #define VACTUAL_REG 0x22
 #define CHOPCONF_REG 0x6C
+
+// --- Control Variables ---
+int32_t speed_hz = 500; // Actual pulse freqency[Hz]
+int32_t prev_speed_hz = 500;
+
+int32_t servo_max_speed_hz = 10000;
+int32_t max_speed_hz = 37000;
+int32_t min_speed_hz = 100;
+int32_t servo_accel_hz = 5000;
+int32_t accel_hz = 500; // Acceleration Limit
+
+float target_angle = 120;
+float target_velocity = 0.0;
+
+float kp_angle = 100, kd_angle = 0.0, ki_angle = 0.0;
+float kp_velocity = 5.0, kd_velocity = 0.0, ki_velocity = 0.0;
+
+float angle = 0.0;
+float prev_angle = 0.0;
+float velocity = 0.0;
+float prev_velocity = 0.0;
+bool velocity_measurement_ready = false;
+
+float error_angle = 0.0;
+float prev_error_angle = 0.0;
+float integral_error_angle = 0.0;
+
+float error_velocity = 0.0;
+float prev_error_velocity = 0.0;
+float integral_error_velocity = 0.0;
+
+float dt = 0.02;
+
+// MODE  0 = SERVO
+// MODE  1 = VELOCITY
+// MODE -1 = STOP
+// MODE  2 = AUTO ROTATION
+int MODE = -1;
+
+// MODE2
+int32_t target_hz_m2 =
+    10000;                 // Target Frequency (Positive(+) CW、Negative(-) CCW)
+int32_t current_hz_m2 = 0; // Current Frequency
+int32_t step_accel = 5;    // Acceleration per loop (Lowering this setting
+                           // reduces the rate of speed increase)
+
+static void reset_command_buffer(void) {
+  memset(cmd_buf, 0, sizeof(cmd_buf));
+  cmd_buf_pos = 0;
+}
+
+static bool parse_float_arg(const char *arg, float min_value, float max_value,
+                            float *out_value) {
+  if (arg[0] == '\0' || arg[0] == ' ') {
+    return false;
+  }
+
+  char *endptr = NULL;
+  errno = 0;
+  float value = strtof(arg, &endptr);
+
+  if (endptr == arg || errno == ERANGE || !isfinite(value)) {
+    return false;
+  }
+
+  if (*endptr != '\0') {
+    return false;
+  }
+
+  if (value < min_value || value > max_value) {
+    return false;
+  }
+
+  *out_value = value;
+  return true;
+}
+
+static bool parse_int32_arg(const char *arg, int32_t min_value,
+                            int32_t max_value, int32_t *out_value) {
+  if (arg[0] == '\0' || arg[0] == ' ') {
+    return false;
+  }
+
+  char *endptr = NULL;
+  errno = 0;
+  long value = strtol(arg, &endptr, 10);
+
+  if (endptr == arg || errno == ERANGE || *endptr != '\0') {
+    return false;
+  }
+
+  if (value < min_value || value > max_value) {
+    return false;
+  }
+
+  *out_value = (int32_t)value;
+  return true;
+}
+
+static void stop_pwm_output(void) {
+  if (timer == NULL) {
+    return;
+  }
+
+  mcpwm_timer_start_stop(timer, MCPWM_TIMER_STOP_EMPTY);
+}
+
+static bool update_pwm_frequency(int32_t hz) {
+  if (hz < min_speed_hz || hz > max_speed_hz) {
+    stop_pwm_output();
+    return false;
+  }
+
+  uint32_t period = MCPWM_RES_HZ / (uint32_t)hz;
+  if (period < MIN_PWM_PERIOD_TICKS) {
+    stop_pwm_output();
+    return false;
+  }
+
+  mcpwm_timer_set_period(timer, period);
+  mcpwm_comparator_set_compare_value(cmpr, period / 2);
+  mcpwm_timer_start_stop(timer, MCPWM_TIMER_START_NO_STOP);
+  return true;
+}
 
 void I2C_Detect() {
   printf("I2C Scanner starting...\n");
@@ -130,59 +270,127 @@ bool sendConfig(uart_port_t uart_num, uint8_t addr_register, uint32_t *data) {
   return uart_write_bytes(uart_num, &frame, 8);
 }
 
-void communication(int *MODE, float *target_angle, float *target_velocity, int32_t *speed_hz, int32_t *target_hz_m2) {
-  char recv_data[128];
-  int recv_len =
-      uart_read_bytes(uart_num_pc, recv_data, sizeof(recv_data) - 1, 0);
-  if (recv_len > 0) {
-    recv_data[recv_len] = '\0';
-    char *p;
-    if ((p = strstr(recv_data, "SETANGLE:")) != NULL) {
-      // MODE SERVO
-      *MODE = 0;
-      *target_angle = atof(p + 9);
-      *target_velocity = 0;
-      printf("Angle updated: %.2f\n", *target_angle);
-    } else if ((p = strstr(recv_data, "SETVELOCITY:")) != NULL) {
-      // MODE VELOCITY
-      *MODE = 1;
-      *target_angle = 0;
-      *target_velocity = atof(p + 12);
-      if(*target_velocity > 0){
-        gpio_set_level(DIR_PIN, 1);
-      }else if(*target_velocity < 0){
-        gpio_set_level(DIR_PIN, 0);
+void parse() {
+  if (cmd_buf[0] == '\0') {
+    return;
+  }
+
+  if (strncmp(cmd_buf, "SETANGLE:", 9) == 0) {
+    float val = 0.0f;
+    if (!parse_float_arg(cmd_buf + 9, 0.0f, 360.0f, &val)) {
+      printf("Invalid SETANGLE value\n");
+      return;
+    }
+
+    MODE = 0;
+    target_angle = val;
+    target_velocity = 0.0f;
+    integral_error_angle = 0.0f;
+    prev_error_angle = 0.0f;
+    velocity_measurement_ready = false;
+
+    printf("Angle updated: %.2f\n", target_angle);
+  } else if (strncmp(cmd_buf, "SETVELOCITY:", 12) == 0) {
+    float val = 0.0f;
+    if (!parse_float_arg(cmd_buf + 12, -5000.0f, 5000.0f, &val)) {
+      printf("Invalid SETVELOCITY value\n");
+      return;
+    }
+
+    MODE = 1;
+    target_angle = 0.0f;
+    target_velocity = val;
+    integral_error_velocity = 0.0f;
+    prev_error_velocity = 0.0f;
+    velocity_measurement_ready = false;
+    gpio_set_level(DIR_PIN, (target_velocity >= 0.0f));
+
+    printf("Velocity updated: %.2f\n", target_velocity);
+  } else if (strcmp(cmd_buf, "STOP") == 0) {
+    MODE = -1;
+    target_angle = 0.0f;
+    target_velocity = 0.0f;
+    speed_hz = 0;
+    current_hz_m2 = 0;
+    target_hz_m2 = 0;
+    integral_error_angle = 0.0f;
+    integral_error_velocity = 0.0f;
+    velocity_measurement_ready = false;
+    stop_pwm_output();
+
+    printf("EMERGENCY STOP\n");
+  } else if (strncmp(cmd_buf, "SETM2:", 6) == 0) {
+    int32_t val = 0;
+    if (!parse_int32_arg(cmd_buf + 6, -max_speed_hz, max_speed_hz, &val)) {
+      printf("Invalid SETM2 value. Allowed range: %ld..%ld Hz\n",
+             (long)-max_speed_hz, (long)max_speed_hz);
+      return;
+    }
+
+    MODE = 2;
+    target_hz_m2 = val;
+    velocity_measurement_ready = false;
+
+    printf("Mode 2 target Hz updated: %ld\n", (long)target_hz_m2);
+  } else {
+    printf("Unknown command: [%s]\n", cmd_buf);
+  }
+}
+
+
+void receive() {
+  int length = uart_read_bytes(uart_num_pc, data, sizeof(data) - 1, 100);
+  if (length <= 0) {
+    return;
+  }
+
+  for (int i = 0; i < length; i++) {
+    uint8_t ch = (uint8_t)data[i];
+
+    if (ch == '\n') {
+      if (cmd_discarding) {
+        printf("Invalid input line discarded\n");
+        cmd_discarding = false;
+      } else {
+        cmd_buf[cmd_buf_pos] = '\0';
+        parse();
       }
-      printf("Velocity updated: %.2f\n", *target_velocity);
-    } else if ((p = strstr(recv_data, "STOP")) != NULL) {
-      // MODE STOP
-      *MODE = -1;
-      *target_angle = 0;
-      *target_velocity = 0;
-      *speed_hz = 0;
-      mcpwm_timer_start_stop(timer, MCPWM_TIMER_STOP_EMPTY);
-      printf("EMERGENCY STOP\n");
-    }else if ((p = strstr(recv_data, "SETM2:")) != NULL) {
-        // Set top speed(Hz)
-        // For example "SETM2:2000" (CW2000Hz) or "SETM2:-1500" (CCW1500Hz)
-        *MODE = 2;
-        *target_hz_m2 = atoi(p + 6);
-        printf("Mode 2 target Hz updated: %ld\n", *target_hz_m2);
+      reset_command_buffer();
+      continue;
+    }
+
+    if (ch == '\r') {
+      continue;
+    }
+
+    if (cmd_discarding) {
+      continue;
+    }
+
+    if (ch < 0x20 || ch > 0x7e) {
+      reset_command_buffer();
+      cmd_discarding = true;
+      continue;
+    }
+
+    if (cmd_buf_pos < MAX_CMD_LENGTH) {
+      cmd_buf[cmd_buf_pos++] = (char)ch;
+    } else {
+      reset_command_buffer();
+      cmd_discarding = true;
     }
   }
-  // vTaskDelay(pdMS_TO_TICKS(1));
 }
 
 void app_main() {
   // MCPWM
   // timer
-  uint32_t mcpwm_res = 1000000;
-  uint32_t tick = 1000;
+  uint32_t tick = DEFAULT_PERIOD_TICKS;
 
   mcpwm_timer_config_t timer_conf = {
       .group_id = 0,
       .clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT,
-      .resolution_hz = mcpwm_res,
+      .resolution_hz = MCPWM_RES_HZ,
       .count_mode = MCPWM_TIMER_COUNT_MODE_UP,
       .period_ticks = tick,
   };
@@ -255,8 +463,8 @@ void app_main() {
   // I2C
   i2c_master_bus_config_t bus_conf = {
       .i2c_port = -1,
-      .sda_io_num = 17,
-      .scl_io_num = 33,
+      .sda_io_num = 21,
+      .scl_io_num = 22,
       .clk_source = I2C_CLK_SRC_DEFAULT,
       .glitch_ignore_cnt = 7,
   };
@@ -272,11 +480,11 @@ void app_main() {
       i2c_master_bus_add_device(bus_handler, &as5600_conf, &as5600_handler));
 
   // UART
-  uart_driver_install(uart_num, uart_buffer_size, uart_buffer_size, 10,
-                      &uart_queue, 0);
+  uart_driver_install(uart_num, uart_buffer_size, uart_buffer_size, 20,
+                      &uart_queue_motor, 0);
 
-  uart_driver_install(uart_num_pc, uart_buffer_size, uart_buffer_size, 10,
-                      &uart_queue, 0);
+  uart_driver_install(uart_num_pc, uart_buffer_size, uart_buffer_size, 20,
+                      &uart_queue_pc, 0);
   uart_config_t uart_config = {
       .baud_rate = 115200,
       .data_bits = UART_DATA_8_BITS,
@@ -285,6 +493,7 @@ void app_main() {
       .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
       .rx_flow_ctrl_thresh = 122,
   };
+
   ESP_ERROR_CHECK(uart_param_config(uart_num, &uart_config));
   ESP_ERROR_CHECK(uart_param_config(uart_num_pc, &uart_config));
   ESP_ERROR_CHECK(uart_set_pin(uart_num, UART_RX, UART_TX, -1, -1));
@@ -306,14 +515,16 @@ void app_main() {
 
   vTaskDelay(100);
 
+  gpio_set_direction(DIR_PIN, GPIO_MODE_OUTPUT);
+
   // IRUN=16 (bit8-12), IHOLD=2 (bit0-4), IHOLDDELAY=4 (bit16-19)
   uint32_t current_data = (16 << 8) | (2 << 0) | (4 << 16);
   sendConfig(uart_num, IHOLD_IRUN_REG, &current_data);
 
   vTaskDelay(100);
 
-  // Standby transition time: Delay between IHOLD stop detection and the transition to IHOLD
-  // value * 2^18 / fCLK ≒ 10 * 21.8ms ≒ 218ms
+  // Standby transition time: Delay between IHOLD stop detection and the
+  // transition to IHOLD value * 2^18 / fCLK ≒ 10 * 21.8ms ≒ 218ms
   uint32_t tpowerdown = 10;
   sendConfig(uart_num, TPOWERDOWN_REG, &tpowerdown);
 
@@ -323,62 +534,25 @@ void app_main() {
   uint32_t chop = 0x04000003;
   sendConfig(uart_num, CHOPCONF_REG, &chop);
 
-  // --- Control Variables ---
-  int32_t speed_hz = 500; // Actual pulse freqency[Hz]
-  int32_t prev_speed_hz = 500;
-
-  int32_t servo_max_speed_hz = 10000;
-  int32_t max_speed_hz = 37000;
-  int32_t min_speed_hz = 100;
-  int32_t servo_accel_hz = 5000;
-  int32_t accel_hz = 500; // Acceleration Limit
-
-  gpio_set_direction(DIR_PIN, GPIO_MODE_OUTPUT);
-
-  float target_angle = 120;
-  float target_velocity = 0.0;
-
-  float kp_angle = 100, kd_angle = 0.0, ki_angle = 0.0;
-  float kp_velocity = 5.0, kd_velocity = 0.0, ki_velocity = 0.0;
-
-  float angle = 0.0;
-  float prev_angle = 0.0;
-  float velocity = 0.0;
-  float prev_velocity = 0.0;
-
-  float error_angle = 0.0;
-  float prev_error_angle = 0.0;
-  float integral_error_angle = 0.0;
-
-  float error_velocity = 0.0;
-  float prev_error_velocity = 0.0;
-  float integral_error_velocity = 0.0;
-
-  float dt = 0.02;
-
-  // MODE  0 = SERVO
-  // MODE  1 = VELOCITY
-  // MODE -1 = STOP
-  // MODE  2 = AUTO ROTATION
-  int MODE = -1;
-
-  // MODE2
-  int32_t target_hz_m2 = 2000;   // Target Frequency (Positive(+) CW、Negative(-) CCW)
-  int32_t current_hz_m2 = 0;  // Current Frequency
-  int32_t step_accel = 5;     // Acceleration per loop (Lowering this setting reduces the rate of speed increase)
-
-  ESP_ERROR_CHECK(mcpwm_timer_start_stop(timer, MCPWM_TIMER_START_NO_STOP));
+  stop_pwm_output();
 
   uint64_t prev_time = esp_timer_get_time();
 
   while (true) {
     uint64_t current_time = esp_timer_get_time();
     dt = (float)(current_time - prev_time) / 1000000.0f;
-    if(dt <= 0.0f){
+    if (dt <= 0.0f) {
       dt = 0.0001f;
     }
     prev_time = current_time;
-    GetRawAngle(&angle);
+    bool needs_angle = (MODE == 0 || MODE == 1);
+    bool angle_read_failed = needs_angle && GetRawAngle(&angle);
+    if (needs_angle && angle_read_failed) {
+      stop_pwm_output();
+      vTaskDelay(pdMS_TO_TICKS(5));
+      receive();
+      continue;
+    }
     // MODE SERVO
     if (MODE == 0) {
       error_angle = target_angle - angle;
@@ -391,18 +565,31 @@ void app_main() {
       // error evaluate
       if (fabs(error_angle) < 3) {
         speed_hz = 0;
-        integral_error_angle = 0;
-        mcpwm_timer_start_stop(timer, MCPWM_TIMER_STOP_EMPTY);
-        printf("STOPPED | Angle: %.2f | Error: %.2f\n", angle, error_angle);
-        vTaskDelay(5);
-        communication(&MODE, &target_angle, &target_velocity, &speed_hz, &target_hz_m2);
+        prev_speed_hz = 0;
+        integral_error_angle = 0.0f;
+        stop_pwm_output();
+        // printf("STOPPED | Angle: %.2f | Error: %.2f\n", angle,
+        // error_angle);
+        vTaskDelay(pdMS_TO_TICKS(5));
+        receive();
+        continue;
       }
 
       integral_error_angle += error_angle * dt;
 
-      speed_hz = fabs(kp_angle * error_angle +
-                      kd_angle * (error_angle - prev_error_angle) / dt +
-                      ki_angle * integral_error_angle);
+      float control_hz = fabs(kp_angle * error_angle +
+                              kd_angle * (error_angle - prev_error_angle) / dt +
+                              ki_angle * integral_error_angle);
+      if (!isfinite(control_hz)) {
+        MODE = -1;
+        speed_hz = 0;
+        stop_pwm_output();
+        printf("Invalid servo control value, stopped\n");
+        vTaskDelay(pdMS_TO_TICKS(5));
+        receive();
+        continue;
+      }
+      speed_hz = (int32_t)control_hz;
 
       if (speed_hz > servo_max_speed_hz) {
         speed_hz = servo_max_speed_hz;
@@ -421,25 +608,39 @@ void app_main() {
         gpio_set_level(DIR_PIN, 0);
       }
 
-      uint32_t period = mcpwm_res / speed_hz;
-      mcpwm_timer_set_period(timer, period);
-      mcpwm_comparator_set_compare_value(cmpr, period / 2);
-      mcpwm_timer_start_stop(timer, MCPWM_TIMER_START_NO_STOP);
+      update_pwm_frequency(speed_hz);
 
       prev_error_angle = error_angle;
       prev_speed_hz = speed_hz;
-      printf("Angle: %.2f | Target: %.2f | Error: %.2f |Freq: %ld Hz\n", angle,
-             target_angle, error_angle, speed_hz);
-      
-      vTaskDelay(5);
+      /*printf("Angle: %.2f | Target: %.2f | Error: %.2f |Freq: %ld Hz\n",
+         angle, target_angle, error_angle, speed_hz);*/
+
+      vTaskDelay(pdMS_TO_TICKS(5));
     }
     // MODE VELOCITY
-    else if (MODE == 1) { 
-      // incomplete 
+    else if (MODE == 1) {
+      if (fabs(target_velocity) < EPSILON) {
+        speed_hz = 0;
+        prev_speed_hz = 0;
+        integral_error_velocity = 0.0f;
+        stop_pwm_output();
+        vTaskDelay(pdMS_TO_TICKS(5));
+        receive();
+        continue;
+      }
+
+      // incomplete
+      if (!velocity_measurement_ready) {
+        prev_angle = angle;
+        prev_velocity = 0.0f;
+        prev_error_velocity = 0.0f;
+        velocity_measurement_ready = true;
+      }
+
       float delta_angle = angle - prev_angle;
-      if(delta_angle >= 180.0){
+      if (delta_angle >= 180.0) {
         delta_angle -= 360.0;
-      }else if(delta_angle < -180.0){
+      } else if (delta_angle < -180.0) {
         delta_angle += 360.0;
       }
 
@@ -448,7 +649,20 @@ void app_main() {
 
       integral_error_velocity += error_velocity;
 
-      speed_hz = fabs(kp_velocity * error_velocity + kd_velocity * (error_velocity - prev_error_velocity) / dt + ki_velocity * integral_error_velocity);
+      float control_hz =
+          fabs(kp_velocity * error_velocity +
+               kd_velocity * (error_velocity - prev_error_velocity) / dt +
+               ki_velocity * integral_error_velocity);
+      if (!isfinite(control_hz)) {
+        MODE = -1;
+        speed_hz = 0;
+        stop_pwm_output();
+        printf("Invalid velocity control value, stopped\n");
+        vTaskDelay(pdMS_TO_TICKS(5));
+        receive();
+        continue;
+      }
+      speed_hz = (int32_t)control_hz;
 
       if (speed_hz > max_speed_hz) {
         speed_hz = max_speed_hz;
@@ -459,33 +673,34 @@ void app_main() {
       if ((speed_hz - prev_speed_hz) > servo_accel_hz) {
         speed_hz = prev_speed_hz + accel_hz;
       }
-      
-      uint32_t period = mcpwm_res / speed_hz;
-      mcpwm_timer_set_period(timer, period);
-      mcpwm_comparator_set_compare_value(cmpr, period / 2);
-      mcpwm_timer_start_stop(timer, MCPWM_TIMER_START_NO_STOP);
+
+      update_pwm_frequency(speed_hz);
 
       prev_error_velocity = error_velocity;
       prev_velocity = velocity;
       prev_speed_hz = speed_hz;
 
-      printf("Velocity: %.2f deg/s | Target: %.2f deg/s | Error: %.2f deg/s | Freq: %ld Hz\n", velocity, target_velocity, error_velocity, speed_hz);
-      vTaskDelay(1);
+      /*printf("Velocity: %.2f deg/s | Target: %.2f deg/s | Error: %.2f deg/s
+         | " "Freq: %ld Hz\n", velocity, target_velocity, error_velocity,
+         speed_hz);*/
+      vTaskDelay(pdMS_TO_TICKS(1));
     }
     // MODE STOP
     else if (MODE == -1) {
-      //printf("Motor State: Stop\n");
-      mcpwm_timer_start_stop(timer, MCPWM_TIMER_STOP_EMPTY);
-      vTaskDelay(5);
+      // printf("Motor State: Stop\n");
+      stop_pwm_output();
+      vTaskDelay(pdMS_TO_TICKS(5));
     }
     // MODE AUTO ROTATION
-    else if(MODE == 2){
+    else if (MODE == 2) {
       if (current_hz_m2 < target_hz_m2) {
         current_hz_m2 += accel_hz;
-        if (current_hz_m2 > target_hz_m2) current_hz_m2 = target_hz_m2;
+        if (current_hz_m2 > target_hz_m2)
+          current_hz_m2 = target_hz_m2;
       } else if (current_hz_m2 > target_hz_m2) {
         current_hz_m2 -= accel_hz;
-        if (current_hz_m2 < target_hz_m2) current_hz_m2 = target_hz_m2;
+        if (current_hz_m2 < target_hz_m2)
+          current_hz_m2 = target_hz_m2;
       }
 
       int32_t abs_hz = current_hz_m2;
@@ -497,18 +712,16 @@ void app_main() {
       }
 
       if (abs_hz < min_speed_hz) {
-        mcpwm_timer_start_stop(timer, MCPWM_TIMER_STOP_EMPTY);
+        stop_pwm_output();
       } else {
-        if (abs_hz > max_speed_hz) abs_hz = max_speed_hz;
+        if (abs_hz > max_speed_hz)
+          abs_hz = max_speed_hz;
 
-        uint32_t period = mcpwm_res / abs_hz;
-        mcpwm_timer_set_period(timer, period);
-        mcpwm_comparator_set_compare_value(cmpr, period / 2);
-        mcpwm_timer_start_stop(timer, MCPWM_TIMER_START_NO_STOP);
+        update_pwm_frequency(abs_hz);
       }
-      vTaskDelay(5);
+      vTaskDelay(pdMS_TO_TICKS(5));
     }
     prev_angle = angle;
-    communication(&MODE, &target_angle, &target_velocity, &speed_hz, &target_hz_m2);
+    receive();
   }
 }
